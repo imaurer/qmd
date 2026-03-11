@@ -30,7 +30,7 @@ import {
   insertEmbedding,
   getStatus,
   hashContent,
-  extractTitle,
+  parseDocumentForIndexing,
   formatDocForEmbedding,
   chunkDocumentByTokens,
   clearCache,
@@ -86,7 +86,6 @@ import {
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
-  getDefaultCollectionNames,
   addContext as yamlAddContext,
   removeContext as yamlRemoveContext,
   removeCollection as yamlRemoveCollectionFn,
@@ -112,13 +111,7 @@ let storeDbPathOverride: string | undefined;
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
-    // Sync YAML config into SQLite store_collections so store.ts reads from DB
-    try {
-      const config = loadConfig();
-      syncConfigToDb(store.db, config);
-    } catch {
-      // Config may not exist yet — that's fine, DB works without it
-    }
+    syncExternalConfig(store.db);
   }
   return store;
 }
@@ -130,11 +123,38 @@ function getDb(): Database {
 /** Re-sync YAML config into SQLite after CLI mutations (add/remove/rename collection, context changes) */
 function resyncConfig(): void {
   const s = getStore();
+  syncExternalConfig(s.db, true);
+}
+
+function hasConfiguredCollections(config: ReturnType<typeof loadConfig>): boolean {
+  return Object.keys(config.collections).length > 0 || config.global_context !== undefined;
+}
+
+function shouldSkipStartupConfigSync(db: Database, config: ReturnType<typeof loadConfig>): boolean {
+  if (!process.env.INDEX_PATH || storeDbPathOverride !== undefined) {
+    return false;
+  }
+
+  if (!hasConfiguredCollections(config)) {
+    return true;
+  }
+
+  return listCollections(db).length > 0;
+}
+
+function syncExternalConfig(db: Database, force: boolean = false): void {
   try {
     const config = loadConfig();
-    // Clear config hash to force re-sync
-    s.db.prepare(`DELETE FROM store_config WHERE key = 'config_hash'`).run();
-    syncConfigToDb(s.db, config);
+
+    if (!force && shouldSkipStartupConfigSync(db, config)) {
+      return;
+    }
+
+    if (force) {
+      db.prepare(`DELETE FROM store_config WHERE key = 'config_hash'`).run();
+    }
+
+    syncConfigToDb(db, config);
   } catch {
     // Config may not exist — that's fine
   }
@@ -1529,8 +1549,10 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       continue;
     }
 
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
+    const parsed = parseDocumentForIndexing(content, relativeFile);
+    const metadata = { source: collectionName, ...(parsed.metadata ?? {}) };
+    const hash = await hashContent(parsed.rawBody);
+    const title = parsed.title;
 
     // Check if document exists in this collection with this path
     const existing = findActiveDocument(db, collectionName, path);
@@ -1538,28 +1560,32 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     if (existing) {
       if (existing.hash === hash) {
         // Hash unchanged, but check if title needs updating
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
+        insertContent(db, hash, parsed.rawBody, now, parsed.searchBody);
+        const metadataChanged = JSON.stringify(existing.metadata) !== JSON.stringify(metadata);
+        if (existing.title !== title || metadataChanged) {
+          updateDocumentTitle(db, existing.id, title, now, metadata);
           updated++;
         } else {
           unchanged++;
         }
       } else {
         // Content changed - insert new content hash and update document
-        insertContent(db, hash, content, now);
+        insertContent(db, hash, parsed.rawBody, now, parsed.searchBody);
         const stat = statSync(filepath);
         updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
+          stat ? new Date(stat.mtime).toISOString() : now,
+          metadata);
         updated++;
       }
     } else {
       // New document - insert content and document
       indexed++;
-      insertContent(db, hash, content, now);
+      insertContent(db, hash, parsed.rawBody, now, parsed.searchBody);
       const stat = statSync(filepath);
       insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+        stat ? new Date(stat.mtime).toISOString() : now,
+        metadata);
     }
 
     processed++;
@@ -1724,6 +1750,8 @@ type OutputOptions = {
   context?: string;      // Optional context for query expansion
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
+  filters?: string[];
+  where?: string;
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1797,6 +1825,7 @@ type OutputRow = {
   chunkPos?: number;
   hash?: string;
   docid?: string;
+  metadata?: Record<string, unknown> | null;
   explain?: HybridQueryExplain;
 };
 
@@ -1827,6 +1856,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         file: toQmdPath(row.displayPath),
         title: row.title,
         ...(row.context && { context: row.context }),
+        ...(row.metadata && { metadata: row.metadata }),
         ...(body && { body }),
         ...(snippet && { snippet }),
         ...(opts.explain && row.explain && { explain: row.explain }),
@@ -1945,16 +1975,20 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
 // Resolve -c collection filter: supports single string, array, or undefined.
 // Returns validated collection names (exits on unknown collection).
 function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
+  const dbCollections = listCollections(getDb());
+  const knownNames = new Set(dbCollections.map(coll => coll.name));
+
   // If no filter specified and useDefaults is true, use default collections
   if (!raw && useDefaults) {
-    return getDefaultCollectionNames();
+    return dbCollections
+      .filter(coll => coll.includeByDefault)
+      .map(coll => coll.name);
   }
   if (!raw) return [];
   const names = Array.isArray(raw) ? raw : [raw];
   const validated: string[] = [];
   for (const name of names) {
-    const coll = getCollectionFromYaml(name);
-    if (!coll) {
+    if (!knownNames.has(name)) {
       console.error(`Collection not found: ${name}`);
       closeDb();
       process.exit(1);
@@ -2075,7 +2109,7 @@ function search(query: string, opts: OutputOptions): void {
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
+    searchFTS(db, query, fetchLimit, singleCollection, { filters: opts.filters, where: opts.where }),
     collectionNames
   );
 
@@ -2086,10 +2120,11 @@ function search(query: string, opts: OutputOptions): void {
     title: r.title,
     body: r.body || "",
     score: r.score,
-    context: getContextForFile(db, r.filepath),
-    hash: r.hash,
-    docid: r.docid,
-  }));
+      context: getContextForFile(db, r.filepath),
+      hash: r.hash,
+      docid: r.docid,
+      metadata: r.metadata,
+    }));
 
   closeDb();
 
@@ -2208,6 +2243,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         candidateLimit: opts.candidateLimit,
         explain: !!opts.explain,
         intent,
+        filters: opts.filters,
+        where: opts.where,
         hooks: {
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
@@ -2234,6 +2271,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         candidateLimit: opts.candidateLimit,
         explain: !!opts.explain,
         intent,
+        filters: opts.filters,
+        where: opts.where,
         hooks: {
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2295,6 +2334,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       score: r.score,
       context: r.context,
       docid: r.docid,
+      metadata: r.metadata,
       explain: r.explain,
     })), displayQuery, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
@@ -2329,6 +2369,8 @@ function parseCLI() {
       json: { type: "boolean" },
       explain: { type: "boolean" },
       collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
+      filter: { type: "string", multiple: true },
+      where: { type: "string" },
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
@@ -2385,6 +2427,8 @@ function parseCLI() {
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     explain: !!values.explain,
     intent: values.intent as string | undefined,
+    filters: values.filter as string[] | undefined,
+    where: values.where as string | undefined,
   };
 
   return {
@@ -2603,6 +2647,8 @@ function showHelp(): void {
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
+  console.log("  --filter <expr>            - Metadata filter (repeatable): field=value, !=, >=, <=, ~");
+  console.log("  --where <expr>             - Advanced metadata filter expression");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");

@@ -115,6 +115,7 @@ export function searchResultsToJson(
       file: row.displayPath,
       title: row.title,
       ...(row.context && { context: row.context }),
+      ...(row.metadata && { metadata: row.metadata }),
       ...(body && { body }),
       ...(snippet && { snippet }),
     };

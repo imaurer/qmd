@@ -18,6 +18,7 @@ import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
+import YAML from "yaml";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -647,6 +648,7 @@ function initializeDatabase(db: Database): void {
     CREATE TABLE IF NOT EXISTS content (
       hash TEXT PRIMARY KEY,
       doc TEXT NOT NULL,
+      search_doc TEXT,
       created_at TEXT NOT NULL
     )
   `);
@@ -660,6 +662,7 @@ function initializeDatabase(db: Database): void {
       path TEXT NOT NULL,
       title TEXT NOT NULL,
       hash TEXT NOT NULL,
+      metadata TEXT,
       created_at TEXT NOT NULL,
       modified_at TEXT NOT NULL,
       active INTEGER NOT NULL DEFAULT 1,
@@ -671,6 +674,17 @@ function initializeDatabase(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
+
+  const contentInfo = db.prepare(`PRAGMA table_info(content)`).all() as { name: string }[];
+  if (!contentInfo.some(col => col.name === "search_doc")) {
+    db.exec(`ALTER TABLE content ADD COLUMN search_doc TEXT`);
+  }
+  db.exec(`UPDATE content SET search_doc = doc WHERE search_doc IS NULL`);
+
+  const documentInfo = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
+  if (!documentInfo.some(col => col.name === "metadata")) {
+    db.exec(`ALTER TABLE documents ADD COLUMN metadata TEXT`);
+  }
 
   // Cache table for LLM API calls
   db.exec(`
@@ -729,6 +743,10 @@ function initializeDatabase(db: Database): void {
   `);
 
   // Triggers to keep FTS in sync
+  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
     WHEN new.active = 1
@@ -738,7 +756,7 @@ function initializeDatabase(db: Database): void {
         new.id,
         new.collection || '/' || new.path,
         new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
+        (SELECT COALESCE(search_doc, doc) FROM content WHERE hash = new.hash)
       WHERE new.active = 1;
     END
   `);
@@ -761,9 +779,22 @@ function initializeDatabase(db: Database): void {
         new.id,
         new.collection || '/' || new.path,
         new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
+        (SELECT COALESCE(search_doc, doc) FROM content WHERE hash = new.hash)
       WHERE new.active = 1;
     END
+  `);
+
+  db.exec(`DELETE FROM documents_fts`);
+  db.exec(`
+    INSERT INTO documents_fts(rowid, filepath, title, body)
+    SELECT
+      d.id,
+      d.collection || '/' || d.path,
+      d.title,
+      COALESCE(c.search_doc, c.doc)
+    FROM documents d
+    JOIN content c ON c.hash = d.hash
+    WHERE d.active = 1
   `);
 }
 
@@ -1008,8 +1039,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string, filter?: SearchFilterOptions) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], filter?: SearchFilterOptions) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1026,11 +1057,11 @@ export type Store = {
   findDocumentByDocid: (docid: string) => { filepath: string; hash: string } | null;
 
   // Document indexing operations
-  insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
-  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
-  updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
-  updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
+  insertContent: (hash: string, content: string, createdAt: string, searchContent?: string) => void;
+  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, metadata?: Record<string, unknown> | null) => void;
+  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; metadata: Record<string, unknown> | null } | null;
+  updateDocumentTitle: (documentId: number, title: string, modifiedAt: string, metadata?: Record<string, unknown> | null) => void;
+  updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string, metadata?: Record<string, unknown> | null) => void;
   deactivateDocument: (collectionName: string, path: string) => void;
   getActiveDocumentPaths: (collectionName: string) => string[];
 
@@ -1116,33 +1147,39 @@ export async function reindexCollection(
       continue;
     }
 
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
+    const parsed = parseDocumentForIndexing(content, relativeFile);
+    const metadata = { source: collectionName, ...(parsed.metadata ?? {}) };
+    const hash = await hashContent(parsed.rawBody);
+    const title = parsed.title;
 
     const existing = findActiveDocument(db, collectionName, path);
 
     if (existing) {
       if (existing.hash === hash) {
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
+        insertContent(db, hash, parsed.rawBody, now, parsed.searchBody);
+        const metadataChanged = JSON.stringify(existing.metadata) !== JSON.stringify(metadata);
+        if (existing.title !== title || metadataChanged) {
+          updateDocumentTitle(db, existing.id, title, now, metadata);
           updated++;
         } else {
           unchanged++;
         }
       } else {
-        insertContent(db, hash, content, now);
+        insertContent(db, hash, parsed.rawBody, now, parsed.searchBody);
         const stat = statSync(filepath);
         updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
+          stat ? new Date(stat.mtime).toISOString() : now,
+          metadata);
         updated++;
       }
     } else {
       indexed++;
-      insertContent(db, hash, content, now);
+      insertContent(db, hash, parsed.rawBody, now, parsed.searchBody);
       const stat = statSync(filepath);
       insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
+        stat ? new Date(stat.mtime).toISOString() : now,
+        metadata);
     }
 
     processed++;
@@ -1360,8 +1397,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchFTS: (query: string, limit?: number, collectionName?: string, filter?: SearchFilterOptions) => searchFTS(db, query, limit, collectionName, filter),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], filter?: SearchFilterOptions) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, filter),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
@@ -1378,11 +1415,11 @@ export function createStore(dbPath?: string): Store {
     findDocumentByDocid: (docid: string) => findDocumentByDocid(db, docid),
 
     // Document indexing operations
-    insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
+    insertContent: (hash: string, content: string, createdAt: string, searchContent?: string) => insertContent(db, hash, content, createdAt, searchContent),
+    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string, metadata?: Record<string, unknown> | null) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt, metadata),
     findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
-    updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
-    updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
+    updateDocumentTitle: (documentId: number, title: string, modifiedAt: string, metadata?: Record<string, unknown> | null) => updateDocumentTitle(db, documentId, title, modifiedAt, metadata),
+    updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string, metadata?: Record<string, unknown> | null) => updateDocument(db, documentId, title, hash, modifiedAt, metadata),
     deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
 
@@ -1413,8 +1450,14 @@ export type DocumentResult = {
   collectionName: string;     // Parent collection name
   modifiedAt: string;         // Last modification timestamp
   bodyLength: number;         // Body length in bytes (useful before loading)
+  metadata?: Record<string, unknown> | null;
   body?: string;              // Document body (optional, load with getDocumentBody)
 };
+
+export interface SearchFilterOptions {
+  filters?: string[];
+  where?: string;
+}
 
 /**
  * Extract short docid from a full hash (first 6 characters).
@@ -1511,6 +1554,7 @@ export type RankedResult = {
   displayPath: string;
   title: string;
   body: string;
+  metadata?: Record<string, unknown> | null;
   score: number;
 };
 
@@ -1777,6 +1821,183 @@ export function extractTitle(content: string, filename: string): string {
   return filename.replace(/\.[^.]+$/, "").split("/").pop() || filename;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isDateLikeString(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}(?:[T ][0-9:.]+(?:Z|[+-]\d{2}:?\d{2})?)?$/.test(value);
+}
+
+function normalizeMetadataValue(value: unknown): unknown {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (Array.isArray(value)) {
+    return value.map(normalizeMetadataValue);
+  }
+  if (isPlainObject(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [key, normalizeMetadataValue(nested)])
+    );
+  }
+  if (typeof value === "string" && isDateLikeString(value)) {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+  return value;
+}
+
+function normalizeMetadataKey(key: string): string {
+  return key
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function parseListLikeValue(key: string, value: string): unknown {
+  const normalizedKey = normalizeMetadataKey(key);
+  const trimmed = value.trim();
+  const isListField = new Set(["labels", "tags", "components", "fix_versions", "client_aliases"]);
+  if (isListField.has(normalizedKey)) {
+    if (!trimmed) return [];
+    return trimmed.split(",").map(part => part.trim()).filter(Boolean);
+  }
+  return trimmed ? normalizeMetadataValue(trimmed) : null;
+}
+
+function deriveHeadingMetadata(title: string): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {};
+
+  const jiraMatch = title.match(/^([A-Z][A-Z0-9]+-\d+)\s+-\s+(.+)$/);
+  if (jiraMatch) {
+    metadata.key = jiraMatch[1];
+    metadata.project = jiraMatch[1]?.split("-")[0] ?? null;
+    return metadata;
+  }
+
+  const zendeskMatch = title.match(/^Zendesk\s+(\d+)\s+-\s+(.+)$/i);
+  if (zendeskMatch) {
+    metadata.ticket_id = zendeskMatch[1];
+    return metadata;
+  }
+
+  const confluenceMatch = title.match(/^Confluence\s+(\d+)\s+-\s+(.+)$/i);
+  if (confluenceMatch) {
+    metadata.page_id = confluenceMatch[1];
+    return metadata;
+  }
+
+  return metadata;
+}
+
+function parseHeadingMetadataBlock(content: string, filename: string): ParsedDocumentForIndexing | null {
+  const lines = content.split(/\r?\n/);
+  if (!lines[0]?.startsWith("# ")) return null;
+  if (lines[1] !== "") return null;
+
+  const metadataEntries: [string, unknown][] = [];
+  let index = 2;
+  while (index < lines.length) {
+    const line = lines[index]!;
+    if (line === "") break;
+    const entry = line.match(/^- ([^:]+):\s*(.*)$/);
+    if (!entry) return null;
+    metadataEntries.push([normalizeMetadataKey(entry[1]!), parseListLikeValue(entry[1]!, entry[2] ?? "")]);
+    index++;
+  }
+
+  if (metadataEntries.length === 0) return null;
+  if (lines[index] !== "") return null;
+
+  const title = extractTitle(content, filename);
+  const rest = lines.slice(index + 1).join("\n");
+  const metadata = {
+    ...Object.fromEntries(metadataEntries),
+    ...deriveHeadingMetadata(title),
+  };
+
+  return {
+    rawBody: content,
+    searchBody: `${lines[0]}\n\n${rest}`.trim(),
+    metadata,
+    title,
+  };
+}
+
+export type ParsedDocumentForIndexing = {
+  rawBody: string;
+  searchBody: string;
+  metadata: Record<string, unknown> | null;
+  title: string;
+};
+
+export function parseDocumentForIndexing(content: string, filename: string): ParsedDocumentForIndexing {
+  const ext = filename.slice(filename.lastIndexOf(".")).toLowerCase();
+  if (ext !== ".md") {
+    return {
+      rawBody: content,
+      searchBody: content,
+      metadata: null,
+      title: extractTitle(content, filename),
+    };
+  }
+
+  const frontmatterMatch = content.match(/^---\s*\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)/);
+  if (!frontmatterMatch) {
+    const headingMetadata = parseHeadingMetadataBlock(content, filename);
+    if (headingMetadata) return headingMetadata;
+    return {
+      rawBody: content,
+      searchBody: content,
+      metadata: null,
+      title: extractTitle(content, filename),
+    };
+  }
+
+  try {
+    const parsed = YAML.parse(frontmatterMatch[1] ?? "");
+    const metadata = isPlainObject(parsed)
+      ? normalizeMetadataValue(parsed) as Record<string, unknown>
+      : null;
+    const searchBody = content.slice(frontmatterMatch[0].length);
+    const titleOverride = typeof metadata?.title === "string" && metadata.title.trim()
+      ? metadata.title.trim()
+      : null;
+
+    return {
+      rawBody: content,
+      searchBody,
+      metadata,
+      title: titleOverride ?? extractTitle(searchBody, filename),
+    };
+  } catch {
+    return {
+      rawBody: content,
+      searchBody: content,
+      metadata: null,
+      title: extractTitle(content, filename),
+    };
+  }
+}
+
+function serializeMetadata(metadata: Record<string, unknown> | null | undefined): string | null {
+  return metadata ? JSON.stringify(metadata) : null;
+}
+
+function parseMetadata(metadata: string | null | undefined): Record<string, unknown> | null {
+  if (!metadata) return null;
+  try {
+    const parsed = JSON.parse(metadata);
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 // =============================================================================
 // Document indexing operations
 // =============================================================================
@@ -1785,9 +2006,19 @@ export function extractTitle(content: string, filename: string): string {
  * Insert content into the content table (content-addressable storage).
  * Uses INSERT OR IGNORE so duplicate hashes are skipped.
  */
-export function insertContent(db: Database, hash: string, content: string, createdAt: string): void {
-  db.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
-    .run(hash, content, createdAt);
+export function insertContent(
+  db: Database,
+  hash: string,
+  content: string,
+  createdAt: string,
+  searchContent: string = content
+): void {
+  db.prepare(`
+    INSERT INTO content (hash, doc, search_doc, created_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(hash) DO UPDATE SET
+      search_doc = excluded.search_doc
+  `).run(hash, content, searchContent, createdAt);
 }
 
 /**
@@ -1800,17 +2031,19 @@ export function insertDocument(
   title: string,
   hash: string,
   createdAt: string,
-  modifiedAt: string
+  modifiedAt: string,
+  metadata?: Record<string, unknown> | null
 ): void {
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
     ON CONFLICT(collection, path) DO UPDATE SET
       title = excluded.title,
       hash = excluded.hash,
       modified_at = excluded.modified_at,
-      active = 1
-  `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+      active = 1,
+      metadata = excluded.metadata
+  `).run(collectionName, path, title, hash, createdAt, modifiedAt, serializeMetadata(metadata));
 }
 
 /**
@@ -1820,12 +2053,13 @@ export function findActiveDocument(
   db: Database,
   collectionName: string,
   path: string
-): { id: number; hash: string; title: string } | null {
+): { id: number; hash: string; title: string; metadata: Record<string, unknown> | null } | null {
   const row = db.prepare(`
-    SELECT id, hash, title FROM documents
+    SELECT id, hash, title, metadata FROM documents
     WHERE collection = ? AND path = ? AND active = 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
-  return row ?? null;
+  `).get(collectionName, path) as { id: number; hash: string; title: string; metadata: string | null } | undefined;
+  if (!row) return null;
+  return { ...row, metadata: parseMetadata(row.metadata) };
 }
 
 /**
@@ -1835,10 +2069,11 @@ export function updateDocumentTitle(
   db: Database,
   documentId: number,
   title: string,
-  modifiedAt: string
+  modifiedAt: string,
+  metadata?: Record<string, unknown> | null
 ): void {
-  db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`)
-    .run(title, modifiedAt, documentId);
+  db.prepare(`UPDATE documents SET title = ?, modified_at = ?, metadata = ? WHERE id = ?`)
+    .run(title, modifiedAt, serializeMetadata(metadata), documentId);
 }
 
 /**
@@ -1850,10 +2085,11 @@ export function updateDocument(
   documentId: number,
   title: string,
   hash: string,
-  modifiedAt: string
+  modifiedAt: string,
+  metadata?: Record<string, unknown> | null
 ): void {
-  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(title, hash, modifiedAt, documentId);
+  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ?, metadata = ? WHERE id = ?`)
+    .run(title, hash, modifiedAt, serializeMetadata(metadata), documentId);
 }
 
 /**
@@ -2615,7 +2851,449 @@ export function validateLexQuery(query: string): string | null {
   return null;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+type FilterValue = string | number | boolean | null;
+type FilterOperator = "=" | "!=" | ">=" | "<=" | "~";
+
+type FilterExpr =
+  | { type: "and"; items: FilterExpr[] }
+  | { type: "or"; items: FilterExpr[] }
+  | { type: "cmp"; field: string; op: FilterOperator; value: FilterValue }
+  | { type: "in"; field: string; values: FilterValue[] }
+  | { type: "missing"; field: string };
+
+type WhereToken =
+  | { type: "identifier"; value: string }
+  | { type: "string"; value: string }
+  | { type: "number"; value: string }
+  | { type: "operator"; value: FilterOperator }
+  | { type: "keyword"; value: string }
+  | { type: "paren"; value: "(" | ")" }
+  | { type: "comma" };
+
+function parseFilterValue(raw: string): FilterValue {
+  const trimmed = raw.trim();
+  if ((trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith('"') && trimmed.endsWith('"'))) {
+    return trimmed.slice(1, -1).replace(/\\(['"])/g, "$1");
+  }
+  if (/^true$/i.test(trimmed)) return true;
+  if (/^false$/i.test(trimmed)) return false;
+  if (/^null$/i.test(trimmed)) return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
+  return trimmed;
+}
+
+function parseSimpleFilter(filter: string): FilterExpr {
+  const match = filter.match(/^\s*([A-Za-z0-9_-]+)\s*(=|!=|>=|<=|~)\s*(.+?)\s*$/);
+  if (!match) {
+    throw new Error(`Invalid filter: "${filter}". Expected field=value, field!=value, field>=value, field<=value, or field~value.`);
+  }
+  return {
+    type: "cmp",
+    field: match[1]!,
+    op: match[2] as FilterOperator,
+    value: parseFilterValue(match[3]!),
+  };
+}
+
+function groupSimpleFilters(filters: string[]): FilterExpr | null {
+  if (filters.length === 0) return null;
+  const parsed = filters.map(parseSimpleFilter);
+  const grouped = new Map<string, FilterExpr[]>();
+  const remaining: FilterExpr[] = [];
+
+  for (const expr of parsed) {
+    if (expr.type === "cmp" && expr.op === "=") {
+      const key = expr.field.toLowerCase();
+      const arr = grouped.get(key) ?? [];
+      arr.push(expr);
+      grouped.set(key, arr);
+    } else {
+      remaining.push(expr);
+    }
+  }
+
+  const groupedExprs = Array.from(grouped.values()).map(items =>
+    items.length === 1 ? items[0]! : { type: "or", items } as FilterExpr
+  );
+
+  const items = [...groupedExprs, ...remaining];
+  return items.length === 1 ? items[0]! : { type: "and", items };
+}
+
+function tokenizeWhere(where: string): WhereToken[] {
+  const tokens: WhereToken[] = [];
+  let i = 0;
+
+  const pushKeywordOrIdentifier = (word: string) => {
+    const upper = word.toUpperCase();
+    if (["AND", "OR", "IN", "IS", "MISSING", "TRUE", "FALSE", "NULL"].includes(upper)) {
+      tokens.push({ type: "keyword", value: upper });
+    } else {
+      tokens.push({ type: "identifier", value: word });
+    }
+  };
+
+  while (i < where.length) {
+    const ch = where[i]!;
+    if (/\s/.test(ch)) {
+      i++;
+      continue;
+    }
+    if (ch === "(" || ch === ")") {
+      tokens.push({ type: "paren", value: ch });
+      i++;
+      continue;
+    }
+    if (ch === ",") {
+      tokens.push({ type: "comma" });
+      i++;
+      continue;
+    }
+    if (where.startsWith("!=", i) || where.startsWith(">=", i) || where.startsWith("<=", i)) {
+      tokens.push({ type: "operator", value: where.slice(i, i + 2) as FilterOperator });
+      i += 2;
+      continue;
+    }
+    if (ch === "=" || ch === "~") {
+      tokens.push({ type: "operator", value: ch as FilterOperator });
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      let j = i + 1;
+      let value = "";
+      while (j < where.length) {
+        const current = where[j]!;
+        if (current === "\\" && j + 1 < where.length) {
+          value += where[j + 1];
+          j += 2;
+          continue;
+        }
+        if (current === quote) break;
+        value += current;
+        j++;
+      }
+      if (j >= where.length || where[j] !== quote) {
+        throw new Error(`Invalid where clause: unterminated string in "${where}"`);
+      }
+      tokens.push({ type: "string", value });
+      i = j + 1;
+      continue;
+    }
+    if (/[0-9]/.test(ch)) {
+      let j = i + 1;
+      while (j < where.length && /[0-9.]/.test(where[j]!)) j++;
+      tokens.push({ type: "number", value: where.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      let j = i + 1;
+      while (j < where.length && /[A-Za-z0-9_-]/.test(where[j]!)) j++;
+      pushKeywordOrIdentifier(where.slice(i, j));
+      i = j;
+      continue;
+    }
+    throw new Error(`Invalid where clause: unexpected token "${ch}" in "${where}"`);
+  }
+
+  return tokens;
+}
+
+function parseWhereValue(token: WhereToken | undefined): FilterValue {
+  if (!token) throw new Error("Invalid where clause: missing value");
+  if (token.type === "string") return token.value;
+  if (token.type === "number") return Number(token.value);
+  if (token.type === "identifier") return token.value;
+  if (token.type === "keyword") {
+    if (token.value === "TRUE") return true;
+    if (token.value === "FALSE") return false;
+    if (token.value === "NULL") return null;
+  }
+  throw new Error("Invalid where clause: unsupported value");
+}
+
+function parseWhereExpression(where: string): FilterExpr {
+  const tokens = tokenizeWhere(where);
+  let index = 0;
+
+  const peek = () => tokens[index];
+  const consume = () => tokens[index++];
+
+  const expectKeyword = (value: string) => {
+    const token = consume();
+    if (token?.type !== "keyword" || token.value !== value) {
+      throw new Error(`Invalid where clause: expected ${value}`);
+    }
+  };
+
+  const parsePredicate = (): FilterExpr => {
+    const field = consume();
+    if (field?.type !== "identifier") {
+      throw new Error("Invalid where clause: expected field name");
+    }
+
+    const next = consume();
+    if (!next) {
+      throw new Error("Invalid where clause: incomplete expression");
+    }
+
+    if (next.type === "keyword" && next.value === "IS") {
+      expectKeyword("MISSING");
+      return { type: "missing", field: field.value };
+    }
+
+    if (next.type === "keyword" && next.value === "IN") {
+      const open = consume();
+      if (open?.type !== "paren" || open.value !== "(") {
+        throw new Error("Invalid where clause: expected '(' after IN");
+      }
+      const values: FilterValue[] = [];
+      while (true) {
+        values.push(parseWhereValue(consume()));
+        const token = consume();
+        if (token?.type === "paren" && token.value === ")") break;
+        if (token?.type !== "comma") {
+          throw new Error("Invalid where clause: expected ',' or ')' in IN list");
+        }
+      }
+      return { type: "in", field: field.value, values };
+    }
+
+    if (next.type !== "operator") {
+      throw new Error("Invalid where clause: expected comparison operator");
+    }
+
+    return {
+      type: "cmp",
+      field: field.value,
+      op: next.value,
+      value: parseWhereValue(consume()),
+    };
+  };
+
+  const parsePrimary = (): FilterExpr => {
+    const token = peek();
+    if (token?.type === "paren" && token.value === "(") {
+      consume();
+      const expr = parseOr();
+      const close = consume();
+      if (close?.type !== "paren" || close.value !== ")") {
+        throw new Error("Invalid where clause: expected ')'");
+      }
+      return expr;
+    }
+    return parsePredicate();
+  };
+
+  const parseAnd = (): FilterExpr => {
+    let expr = parsePrimary();
+    while (true) {
+      const token = peek();
+      if (token?.type !== "keyword" || token.value !== "AND") break;
+      consume();
+      const right = parsePrimary();
+      expr = expr.type === "and"
+        ? { type: "and", items: [...expr.items, right] }
+        : { type: "and", items: [expr, right] };
+    }
+    return expr;
+  };
+
+  const parseOr = (): FilterExpr => {
+    let expr = parseAnd();
+    while (true) {
+      const token = peek();
+      if (token?.type !== "keyword" || token.value !== "OR") break;
+      consume();
+      const right = parseAnd();
+      expr = expr.type === "or"
+        ? { type: "or", items: [...expr.items, right] }
+        : { type: "or", items: [expr, right] };
+    }
+    return expr;
+  };
+
+  const expr = parseOr();
+  if (index !== tokens.length) {
+    throw new Error(`Invalid where clause: unexpected token near "${where}"`);
+  }
+  return expr;
+}
+
+function fieldTypeExpr(alias: string, params: unknown[], field: string): string {
+  params.push(field);
+  return `(SELECT type FROM json_each(${alias}.metadata) WHERE lower(key) = lower(?) LIMIT 1)`;
+}
+
+function fieldValueExpr(alias: string, params: unknown[], field: string): string {
+  params.push(field);
+  return `(SELECT value FROM json_each(${alias}.metadata) WHERE lower(key) = lower(?) LIMIT 1)`;
+}
+
+function fieldArrayMatchExpr(alias: string, params: unknown[], field: string, op: "=" | "~", value: string): string {
+  params.push(field, field, value);
+  if (op === "=") {
+    return `EXISTS (
+      SELECT 1
+      FROM json_each(
+        CASE
+          WHEN (SELECT type FROM json_each(${alias}.metadata) WHERE lower(key) = lower(?) LIMIT 1) = 'array'
+            THEN (SELECT value FROM json_each(${alias}.metadata) WHERE lower(key) = lower(?) LIMIT 1)
+          ELSE '[]'
+        END
+      ) elem
+      WHERE lower(CAST(elem.value AS TEXT)) = lower(?)
+    )`;
+  }
+  return `EXISTS (
+    SELECT 1
+    FROM json_each(
+      CASE
+        WHEN (SELECT type FROM json_each(${alias}.metadata) WHERE lower(key) = lower(?) LIMIT 1) = 'array'
+          THEN (SELECT value FROM json_each(${alias}.metadata) WHERE lower(key) = lower(?) LIMIT 1)
+        ELSE '[]'
+      END
+    ) elem
+    WHERE lower(CAST(elem.value AS TEXT)) LIKE '%' || lower(?) || '%'
+  )`;
+}
+
+function compileScalarComparison(alias: string, field: string, op: FilterOperator, value: FilterValue, params: unknown[]): string {
+  if (value === null) {
+    if (op === "=") return `${fieldTypeExpr(alias, params, field)} = 'null'`;
+    if (op === "!=") return `${fieldTypeExpr(alias, params, field)} IS NOT NULL AND ${fieldTypeExpr(alias, params, field)} != 'null'`;
+    throw new Error("Null filters only support = and !=");
+  }
+
+  if (typeof value === "boolean") {
+    if (op === "=") {
+      const typeExpr = fieldTypeExpr(alias, params, field);
+      params.push(value ? "true" : "false");
+      return `${typeExpr} = ?`;
+    }
+    if (op === "!=") {
+      const typeExpr = fieldTypeExpr(alias, params, field);
+      const typeExpr2 = fieldTypeExpr(alias, params, field);
+      params.push(value ? "true" : "false");
+      return `${typeExpr} IS NOT NULL AND ${typeExpr2} != ?`;
+    }
+    throw new Error("Boolean filters only support = and !=");
+  }
+
+  if (typeof value === "number") {
+    if (op === "=") {
+      const typeExpr = fieldTypeExpr(alias, params, field);
+      const valueExpr = fieldValueExpr(alias, params, field);
+      params.push(value);
+      return `${typeExpr} IN ('integer', 'real') AND CAST(${valueExpr} AS REAL) = ?`;
+    }
+    if (op === "!=") {
+      const typeExpr = fieldTypeExpr(alias, params, field);
+      const typeExpr2 = fieldTypeExpr(alias, params, field);
+      const valueExpr = fieldValueExpr(alias, params, field);
+      params.push(value);
+      return `${typeExpr} IS NOT NULL AND (${typeExpr2} NOT IN ('integer', 'real') OR CAST(${valueExpr} AS REAL) != ?)`;
+    }
+    if (op === ">=") {
+      const typeExpr = fieldTypeExpr(alias, params, field);
+      const valueExpr = fieldValueExpr(alias, params, field);
+      params.push(value);
+      return `${typeExpr} IN ('integer', 'real', 'text') AND CAST(${valueExpr} AS REAL) >= ?`;
+    }
+    if (op === "<=") {
+      const typeExpr = fieldTypeExpr(alias, params, field);
+      const valueExpr = fieldValueExpr(alias, params, field);
+      params.push(value);
+      return `${typeExpr} IN ('integer', 'real', 'text') AND CAST(${valueExpr} AS REAL) <= ?`;
+    }
+    const valueExpr = fieldValueExpr(alias, params, field);
+    params.push(String(value));
+    return `lower(CAST(${valueExpr} AS TEXT)) LIKE '%' || lower(?) || '%'`;
+  }
+
+  if (op === "=") {
+    const valueExpr = fieldValueExpr(alias, params, field);
+    params.push(String(value));
+    return `lower(CAST(${valueExpr} AS TEXT)) = lower(?)`;
+  }
+  if (op === "!=") {
+    const typeExpr = fieldTypeExpr(alias, params, field);
+    const valueExpr = fieldValueExpr(alias, params, field);
+    params.push(String(value));
+    return `${typeExpr} IS NOT NULL AND lower(CAST(${valueExpr} AS TEXT)) != lower(?)`;
+  }
+  if (op === ">=") {
+    const valueExpr = fieldValueExpr(alias, params, field);
+    params.push(String(value));
+    return `CAST(${valueExpr} AS TEXT) >= ?`;
+  }
+  if (op === "<=") {
+    const valueExpr = fieldValueExpr(alias, params, field);
+    params.push(String(value));
+    return `CAST(${valueExpr} AS TEXT) <= ?`;
+  }
+  const valueExpr = fieldValueExpr(alias, params, field);
+  params.push(String(value));
+  return `lower(CAST(${valueExpr} AS TEXT)) LIKE '%' || lower(?) || '%'`;
+}
+
+function compileFilterExpr(expr: FilterExpr, params: unknown[], alias: string = "d"): string {
+  if (expr.type === "and" || expr.type === "or") {
+    const joiner = expr.type === "and" ? " AND " : " OR ";
+    return `(${expr.items.map(item => compileFilterExpr(item, params, alias)).join(joiner)})`;
+  }
+
+  if (expr.type === "missing") {
+    const typeExpr = fieldTypeExpr(alias, params, expr.field);
+    return `(${typeExpr} IS NULL)`;
+  }
+
+  if (expr.type === "in") {
+    const items = expr.values.map(value => ({
+      type: "cmp" as const,
+      field: expr.field,
+      op: "=" as const,
+      value,
+    }));
+    return compileFilterExpr({ type: "or", items }, params, alias);
+  }
+
+  const arrayCapable = typeof expr.value === "string" && (expr.op === "=" || expr.op === "!=" || expr.op === "~");
+  if (!arrayCapable) {
+    const existsExpr = fieldTypeExpr(alias, params, expr.field);
+    const notArrayExpr = fieldTypeExpr(alias, params, expr.field);
+    const scalarExpr = compileScalarComparison(alias, expr.field, expr.op, expr.value, params);
+    return `(${existsExpr} IS NOT NULL AND ${notArrayExpr} != 'array' AND ${scalarExpr})`;
+  }
+
+  const existsExpr = fieldTypeExpr(alias, params, expr.field);
+  const arrayTypeExpr = fieldTypeExpr(alias, params, expr.field);
+  const arrayExpr = fieldArrayMatchExpr(alias, params, expr.field, expr.op === "~" ? "~" : "=", String(expr.value));
+  const scalarTypeExpr = fieldTypeExpr(alias, params, expr.field);
+  const scalarExpr = compileScalarComparison(alias, expr.field, expr.op, expr.value, params);
+  if (expr.op === "=" || expr.op === "~") {
+    return `(${existsExpr} IS NOT NULL AND ((${arrayTypeExpr} = 'array' AND ${arrayExpr}) OR (${scalarTypeExpr} != 'array' AND ${scalarExpr})))`;
+  }
+  return `(${existsExpr} IS NOT NULL AND ((${arrayTypeExpr} = 'array' AND NOT ${arrayExpr}) OR (${scalarTypeExpr} != 'array' AND ${scalarExpr})))`;
+}
+
+function buildMetadataFilterClause(filter: SearchFilterOptions | undefined, alias: string = "d"): { sql: string; params: unknown[] } {
+  if (!filter?.filters?.length && !filter?.where) {
+    return { sql: "", params: [] };
+  }
+
+  const items: FilterExpr[] = [];
+  const grouped = groupSimpleFilters(filter?.filters ?? []);
+  if (grouped) items.push(grouped);
+  if (filter?.where) items.push(parseWhereExpression(filter.where));
+  const expr = items.length === 1 ? items[0]! : { type: "and", items } as FilterExpr;
+  const params: unknown[] = [];
+  return { sql: compileFilterExpr(expr, params, alias), params };
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string, filter?: SearchFilterOptions): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -2624,26 +3302,33 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body,
+      COALESCE(content.search_doc, content.doc) as body,
       d.hash,
+      d.metadata,
       bm25(documents_fts, 10.0, 1.0) as bm25_score
     FROM documents_fts f
     JOIN documents d ON d.id = f.rowid
     JOIN content ON content.hash = d.hash
     WHERE documents_fts MATCH ? AND d.active = 1
   `;
-  const params: (string | number)[] = [ftsQuery];
+  const params: unknown[] = [ftsQuery];
 
   if (collectionName) {
     sql += ` AND d.collection = ?`;
     params.push(String(collectionName));
   }
 
+  const filterClause = buildMetadataFilterClause(filter);
+  if (filterClause.sql) {
+    sql += ` AND ${filterClause.sql}`;
+    params.push(...filterClause.params);
+  }
+
   // bm25 lower is better; sort ascending.
   sql += ` ORDER BY bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; metadata: string | null; bm25_score: number }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
@@ -2661,6 +3346,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       modifiedAt: "",  // Not available in FTS query
       bodyLength: row.body.length,
       body: row.body,
+      metadata: parseMetadata(row.metadata),
       context: getContextForFile(db, row.filepath),
       score,
       source: "fts" as const,
@@ -2672,7 +3358,16 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(
+  db: Database,
+  query: string,
+  model: string,
+  limit: number = 20,
+  collectionName?: string,
+  session?: ILLMSession,
+  precomputedEmbedding?: number[],
+  filter?: SearchFilterOptions
+): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -2707,22 +3402,29 @@ export async function searchVec(db: Database, query: string, model: string, limi
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body
+      COALESCE(content.search_doc, content.doc) as body,
+      d.metadata
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
     WHERE cv.hash || '_' || cv.seq IN (${placeholders})
   `;
-  const params: string[] = [...hashSeqs];
+  const params: unknown[] = [...hashSeqs];
 
   if (collectionName) {
     docSql += ` AND d.collection = ?`;
     params.push(collectionName);
   }
 
+  const filterClause = buildMetadataFilterClause(filter);
+  if (filterClause.sql) {
+    docSql += ` AND ${filterClause.sql}`;
+    params.push(...filterClause.params);
+  }
+
   const docRows = db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
+    display_path: string; title: string; body: string; metadata: string | null;
   }[];
 
   // Combine with distances and dedupe by filepath
@@ -2750,6 +3452,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         modifiedAt: "",  // Not available in vec query
         bodyLength: row.body.length,
         body: row.body,
+        metadata: parseMetadata(row.metadata),
         context: getContextForFile(db, row.filepath),
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
@@ -2777,7 +3480,7 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  */
 export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
   return db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path
+    SELECT d.hash, COALESCE(c.search_doc, c.doc) as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
@@ -3032,6 +3735,7 @@ type DbDocRow = {
   path: string;
   modified_at: string;
   body_length: number;
+  metadata: string | null;
   body?: string;
 };
 
@@ -3077,7 +3781,8 @@ export function findDocument(db: Database, filename: string, options: { includeB
     d.hash,
     d.collection,
     d.modified_at,
-    LENGTH(content.doc) as body_length
+    LENGTH(content.doc) as body_length,
+    d.metadata
     ${bodyCol}
   `;
 
@@ -3146,6 +3851,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
     collectionName: doc.collection,
     modifiedAt: doc.modified_at,
     bodyLength: doc.body_length,
+    metadata: parseMetadata(doc.metadata),
     ...(options.includeBody && doc.body !== undefined && { body: doc.body }),
   };
 }
@@ -3221,7 +3927,8 @@ export function findDocuments(
     d.hash,
     d.collection,
     d.modified_at,
-    LENGTH(content.doc) as body_length
+    LENGTH(content.doc) as body_length,
+    d.metadata
     ${bodyCol}
   `;
 
@@ -3301,6 +4008,7 @@ export function findDocuments(
         collectionName: row.collection,
         modifiedAt: row.modified_at,
         bodyLength: row.body_length,
+        metadata: parseMetadata(row.metadata),
         ...(options.includeBody && row.body !== undefined && { body: row.body }),
       },
       skipped: false,
@@ -3528,6 +4236,8 @@ export interface HybridQueryOptions {
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
   explain?: boolean;        // include backend/RRF/rerank score traces
   intent?: string;          // domain intent hint for disambiguation
+  filters?: string[];       // metadata filters combined with AND
+  where?: string;           // advanced metadata expression
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
   hooks?: SearchHooks;
 }
@@ -3542,6 +4252,7 @@ export interface HybridQueryResult {
   score: number;            // blended score (full precision)
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
+  metadata?: Record<string, unknown> | null;
   explain?: HybridQueryExplain;
 }
 
@@ -3575,6 +4286,8 @@ export async function hybridQuery(
   const collection = options?.collection;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
+  const filters = options?.filters;
+  const where = options?.where;
   const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
 
@@ -3590,7 +4303,8 @@ export async function hybridQuery(
   // match may not be what the caller wants (e.g. "performance" with intent
   // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection);
+  const searchFilter = { filters, where };
+  const initialFts = store.searchFTS(query, 20, collection, searchFilter);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = !intent && initialFts.length > 0
@@ -3613,7 +4327,7 @@ export async function hybridQuery(
     for (const r of initialFts) docidMap.set(r.filepath, r.docid);
     rankedLists.push(initialFts.map(r => ({
       file: r.filepath, displayPath: r.displayPath,
-      title: r.title, body: r.body || "", score: r.score,
+      title: r.title, body: r.body || "", metadata: r.metadata, score: r.score,
     })));
     rankedListMeta.push({ source: "fts", queryType: "original", query });
   }
@@ -3627,12 +4341,12 @@ export async function hybridQuery(
   // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.query, 20, collection);
+      const ftsResults = store.searchFTS(q.query, 20, collection, searchFilter);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
+          title: r.title, body: r.body || "", metadata: r.metadata, score: r.score,
         })));
         rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
       }
@@ -3665,13 +4379,13 @@ export async function hybridQuery(
 
       const vecResults = await store.searchVec(
         vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
-        undefined, embedding
+        undefined, embedding, searchFilter
       );
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(vecResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
+          title: r.title, body: r.body || "", metadata: r.metadata, score: r.score,
         })));
         rankedListMeta.push({
           source: "vec",
@@ -3754,6 +4468,7 @@ export async function hybridQuery(
           score: rrfScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
+          metadata: cand.metadata,
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -3783,7 +4498,7 @@ export async function hybridQuery(
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
+    displayPath: c.displayPath, title: c.title, body: c.body, metadata: c.metadata,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -3828,6 +4543,7 @@ export async function hybridQuery(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      metadata: candidate?.metadata ?? null,
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
@@ -3935,6 +4651,8 @@ export interface StructuredSearchOptions {
   explain?: boolean;        // include backend/RRF/rerank score traces
   /** Domain intent hint for disambiguation — steers reranking and chunk selection */
   intent?: string;
+  filters?: string[];
+  where?: string;
   /** Skip LLM reranking, use only RRF scores */
   skipRerank?: boolean;
   hooks?: SearchHooks;
@@ -3968,6 +4686,8 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
+  const filters = options?.filters;
+  const where = options?.where;
   const skipRerank = options?.skipRerank ?? false;
   const hooks = options?.hooks;
 
@@ -4003,17 +4723,18 @@ export async function structuredSearch(
 
   // Helper to run search across collections (or all if undefined)
   const collectionList = collections ?? [undefined]; // undefined = all collections
+  const searchFilter = { filters, where };
 
   // Step 1: Run FTS for all lex searches (sync, instant)
   for (const search of searches) {
     if (search.type === 'lex') {
       for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll);
+        const ftsResults = store.searchFTS(search.query, 20, coll, searchFilter);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({
             file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
+            title: r.title, body: r.body || "", metadata: r.metadata, score: r.score,
           })));
           rankedListMeta.push({
             source: "fts",
@@ -4046,13 +4767,13 @@ export async function structuredSearch(
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
             vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
-            undefined, embedding
+            undefined, embedding, searchFilter
           );
           if (vecResults.length > 0) {
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
             rankedLists.push(vecResults.map(r => ({
               file: r.filepath, displayPath: r.displayPath,
-              title: r.title, body: r.body || "", score: r.score,
+              title: r.title, body: r.body || "", metadata: r.metadata, score: r.score,
             })));
             rankedListMeta.push({
               source: "vec",
@@ -4144,6 +4865,7 @@ export async function structuredSearch(
           score: rrfScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
+          metadata: cand.metadata,
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -4172,7 +4894,7 @@ export async function structuredSearch(
 
   // Step 6: Blend RRF position score with reranker score
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
+    displayPath: c.displayPath, title: c.title, body: c.body, metadata: c.metadata,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -4217,6 +4939,7 @@ export async function structuredSearch(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      metadata: candidate?.metadata ?? null,
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);

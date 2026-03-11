@@ -13,6 +13,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
+import { createStore as createQmdStore } from "../src/index.js";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -700,6 +701,68 @@ describe("CLI Search with Collection Filter", () => {
       console.log("stderr:", stderr);
     }
     expect(exitCode).toBe(0);
+  });
+});
+
+describe("CLI Search with DB-backed collections", () => {
+  test("uses DB collection defaults for custom INDEX_PATH instead of unrelated YAML defaults", async () => {
+    const dbPath = getFreshDbPath();
+    const configDir = join(testDir, `custom-db-config-${++testCounter}`);
+    const sourceDir = join(testDir, `custom-db-source-${testCounter}`);
+
+    await mkdir(configDir, { recursive: true });
+    await mkdir(sourceDir, { recursive: true });
+    await writeFile(
+      join(sourceDir, "ticket.md"),
+      `# SOM-1 - Variant history issue
+
+- Status: Done
+- Assignee: Example User
+
+Variant history regression details live here.
+`,
+    );
+
+    const store = await createQmdStore({
+      dbPath,
+      config: {
+        collections: {
+          jira: {
+            path: sourceDir,
+            pattern: "**/*.md",
+          },
+        },
+      },
+    });
+    await store.update();
+    await store.close();
+
+    writeFileSync(
+      join(configDir, "index.yml"),
+      `collections:
+  unrelated:
+    path: /tmp/unrelated
+    pattern: "**/*.md"
+`,
+      "utf-8",
+    );
+
+    const { stdout, stderr, exitCode } = await runQmd(["search", "--json", "variant history"], {
+      dbPath,
+      configDir,
+    });
+
+    if (exitCode !== 0) {
+      console.log("DB-backed collection search failed:");
+      console.log("stdout:", stdout);
+      console.log("stderr:", stderr);
+    }
+
+    expect(exitCode).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].file).toContain("qmd://jira/");
+    expect(parsed[0].title).toContain("SOM-1");
   });
 });
 

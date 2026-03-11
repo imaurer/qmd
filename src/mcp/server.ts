@@ -38,6 +38,7 @@ type SearchResultItem = {
   score: number;
   context: string | null;
   snippet: string;
+  metadata: Record<string, unknown> | null | undefined;
 };
 
 type StatusResult = {
@@ -146,6 +147,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   lines.push("Tips:");
   lines.push("  - File paths in results are relative to their collection.");
   lines.push("  - Use `minScore: 0.5` to filter low-confidence results.");
+  lines.push("  - Use `filters` for simple metadata filtering or `where` for advanced expressions.");
   lines.push("  - Results include a `context` field describing the content type.");
 
   return lines.join("\n");
@@ -293,12 +295,14 @@ Intent-aware lex (C++ performance, not sports):
           "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
         ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+        filters: z.array(z.string()).optional().describe("Simple metadata filters like status=Open or updated>=2026-01-01"),
+        where: z.string().optional().describe("Advanced metadata expression using AND/OR/IN/IS MISSING"),
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, filters, where, intent }) => {
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -313,6 +317,8 @@ Intent-aware lex (C++ performance, not sports):
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
+        filters,
+        where,
         intent,
       });
 
@@ -330,6 +336,7 @@ Intent-aware lex (C++ performance, not sports):
           score: Math.round(r.score * 100) / 100,
           context: r.context,
           snippet: addLineNumbers(snippet, line),
+          metadata: r.metadata,
         };
       });
 
@@ -648,6 +655,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
+          filters: params.filters,
+          where: params.where,
           intent: params.intent,
         });
 
@@ -665,6 +674,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
             score: Math.round(r.score * 100) / 100,
             context: r.context,
             snippet: addLineNumbers(snippet, line),
+            metadata: r.metadata,
           };
         });
 

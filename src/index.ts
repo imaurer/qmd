@@ -161,6 +161,10 @@ export interface SearchOptions {
   minScore?: number;
   /** Include explain traces */
   explain?: boolean;
+  /** Simple metadata filters */
+  filters?: string[];
+  /** Advanced metadata filter expression */
+  where?: string;
 }
 
 /**
@@ -388,6 +392,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           minScore: opts.minScore,
           explain: opts.explain,
           intent: opts.intent,
+          filters: opts.filters,
+          where: opts.where,
           skipRerank,
         });
       }
@@ -399,6 +405,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         minScore: opts.minScore,
         explain: opts.explain,
         intent: opts.intent,
+        filters: opts.filters,
+        where: opts.where,
         skipRerank,
       });
     },
