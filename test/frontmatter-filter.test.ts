@@ -44,15 +44,15 @@ describe("frontmatter filtering", () => {
   });
 
   test("searchFTS filters on scalar, array, and date metadata", async () => {
-    await writeFile(join(docsDir, "a.md"), `---\nstatus: In Test\nassignee: James Cole\ntags:\n  - urgent\nupdated: 2026-01-15T10:00:00-0500\ntitle: Ticket Alpha\n---\n\nJMML rollout note\n`);
-    await writeFile(join(docsDir, "b.md"), `---\nstatus: Done\nassignee: Jane Doe\ntags:\n  - archive\nupdated: 2025-12-01T00:00:00Z\n---\n\nJMML historical note\n`);
+    await writeFile(join(docsDir, "a.md"), `---\nstatus: In Test\nassignee: Alex Example\ntags:\n  - urgent\nupdated: 2026-01-15T10:00:00-0500\ntitle: Ticket Alpha\n---\n\nJMML rollout note\n`);
+    await writeFile(join(docsDir, "b.md"), `---\nstatus: Done\nassignee: Blake Example\ntags:\n  - archive\nupdated: 2025-12-01T00:00:00Z\n---\n\nJMML historical note\n`);
 
     await reindexCollection(store, docsDir, "**/*.md", "docs");
 
     const results = searchFTS(store.db, "JMML", 10, "docs", {
       filters: [
         "status=In Test",
-        "assignee=james cole",
+        "assignee=alex example",
         "tags=urgent",
         "updated>=2026-01-01",
       ],
@@ -62,13 +62,13 @@ describe("frontmatter filtering", () => {
     expect(results[0]?.title).toBe("Ticket Alpha");
     expect(results[0]?.metadata).toMatchObject({
       status: "In Test",
-      assignee: "James Cole",
+      assignee: "Alex Example",
     });
     expect(results[0]?.body).not.toContain("status: In Test");
   });
 
   test("exported heading metadata blocks are indexed as metadata", async () => {
-    await writeFile(join(docsDir, "jira.md"), `# SOM-428 - Cuke: BAM sniffing for region rules\n\n- Type: Story\n- Status: Done\n- Priority: Highest\n- Assignee: Matthew Stachowiak\n- Created: 2015-02-02T14:22:52.229-0500\n- Updated: 2016-07-15T19:41:47.216-0400\n- Labels: Cuke, Dev\n\n## Description\n\nRegion rules note\n`);
+    await writeFile(join(docsDir, "jira.md"), `# SOM-428 - Cuke: BAM sniffing for region rules\n\n- Type: Story\n- Status: Done\n- Priority: Highest\n- Assignee: Casey Example\n- Created: 2015-02-02T14:22:52.229-0500\n- Updated: 2016-07-15T19:41:47.216-0400\n- Labels: Cuke, Dev\n\n## Description\n\nRegion rules note\n`);
 
     await reindexCollection(store, docsDir, "**/*.md", "jira");
 

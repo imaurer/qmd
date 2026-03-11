@@ -963,13 +963,13 @@ Use this section as the living log once work starts.
   Running `qmd embed --force` after that is the safe follow-up because embeddings now come from stripped search content.
 - Manual test notes:
   Focused automated coverage passes in `test/frontmatter-filter.test.ts` and the CLI regression coverage in `test/cli.test.ts`.
-  Real-data validation passed against exported Jira, Zendesk, and Confluence corpora indexed from `/opt/mp/...`.
+  Real-data validation passed against representative exported Jira, Zendesk, and Confluence corpora.
   Verified real CLI cases:
-  `qmd search "variant history" --filter source=jira --filter "assignee=Matthew Stachowiak" --json`
-  `qmd search "UCSF" --where "source='jira' AND assignee='James Cole' AND updated >= '2022-01-01T00:00:00.000Z'" --json`
+  `qmd search "deployment issue" --filter source=jira --filter "assignee=Example User" --json`
+  `qmd search "account" --where "source='jira' AND status='To Do' AND updated >= '2022-01-01T00:00:00.000Z'" --json`
   `qmd search "incident" --filter source=zendesk --filter type=incident --json`
-  `qmd search "metrics" --filter source=confluence --filter space=BO --json`
-  `qmd get qmd://jira/som-7332-mdf-1-amp-tiers-history-has-disappeared-2-cannot-delete-amp-tier-override.md -l 12`
+  `qmd search "metrics" --filter source=confluence --filter space=ENG --json`
+  `qmd get qmd://jira/example-ticket.md -l 12`
   Verified that retrieval still returns raw document text including exporter metadata blocks, while search uses stripped content.
 - Follow-up issues:
   `qmd query` works with filters and `where`, but vector retrieval quality still depends on generating embeddings for the refreshed index.
